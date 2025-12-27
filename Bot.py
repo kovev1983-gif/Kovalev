@@ -24,35 +24,56 @@ logger = logging.getLogger(__name__)
 TOKEN = '8331737679:AAGmlvVP0KRsy5UYPClVZ7BzBCQkaXs2NXU'  # Замените на свой токен от @BotFather
 # ===============================
 
-# Создаем постоянную клавиатуру
+# Упражнения
+EXERCISES = {
+    'pushups': '🏋️ Отжимания',
+    'squats': '🦵 Приседания', 
+    'pullups': '💪 Подтягивания',
+    'plank': '⏱️ Планка'
+}
+
+# Главная клавиатура
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["🏋️ Записать тренировку"],
-        ["📊 Статистика", "📈 Текущий месяц"],
-        ["🏆 Лидеры месяца", "🎉 Победитель"],
+        ["📊 Общая статистика", "📈 Текущий месяц"],
+        ["🏆 Лидеры по упражнениям", "🎉 Общий победитель"],
         ["👤 Моя статистика", "📅 Сегодня"]
     ],
     resize_keyboard=True,
     is_persistent=True
 )
 
+# Клавиатура выбора упражнения
+EXERCISE_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["🏋️ Отжимания", "🦵 Приседания"],
+        ["💪 Подтягивания", "⏱️ Планка"],
+        ["/cancel"]
+    ],
+    resize_keyboard=True
+)
+
 # Инициализация базы данных
 def init_db():
-    conn = sqlite3.connect('pushups.db')
+    conn = sqlite3.connect('workouts.db')
     cursor = conn.cursor()
     
+    # Создаем таблицу для тренировок
     cursor.execute('''
-    CREATE TABLE IF NOT EXISTS pushups (
+    CREATE TABLE IF NOT EXISTS workouts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
         username TEXT,
         first_name TEXT,
         last_name TEXT,
+        exercise_type TEXT NOT NULL,
         count INTEGER NOT NULL,
         date DATE NOT NULL
     )
     ''')
     
+    # Таблица для ежемесячных победителей
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS monthly_winners (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,26 +87,43 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Запись отжиманий
-def add_pushups(user_id, username, first_name, last_name, count):
-    conn = sqlite3.connect('pushups.db')
+# Запись тренировки
+def add_workout(user_id, username, first_name, last_name, exercise_type, count):
+    conn = sqlite3.connect('workouts.db')
     cursor = conn.cursor()
     
     today = datetime.now().strftime('%Y-%m-%d')
     
     cursor.execute('''
-    INSERT INTO pushups (user_id, username, first_name, last_name, count, date)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ''', (user_id, username, first_name, last_name, count, today))
+    INSERT INTO workouts (user_id, username, first_name, last_name, exercise_type, count, date)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (user_id, username, first_name, last_name, exercise_type, count, today))
     
     conn.commit()
     conn.close()
 
 # Получение статистики
-def get_statistics(period='all'):
-    conn = sqlite3.connect('pushups.db')
+def get_statistics(exercise_type=None, period='all'):
+    conn = sqlite3.connect('workouts.db')
     cursor = conn.cursor()
     
+    # Базовый запрос
+    query = '''
+    SELECT user_id, 
+           COALESCE(username, first_name || ' ' || COALESCE(last_name, '')),
+           SUM(count) as total
+    FROM workouts 
+    WHERE 1=1
+    '''
+    
+    params = []
+    
+    # Фильтр по упражнению
+    if exercise_type:
+        query += ' AND exercise_type = ?'
+        params.append(exercise_type)
+    
+    # Фильтр по периоду
     if period == 'month':
         today = datetime.now()
         first_day = today.replace(day=1).strftime('%Y-%m-%d')
@@ -95,48 +133,113 @@ def get_statistics(period='all'):
             last_day = today.replace(month=today.month+1, day=1) - timedelta(days=1)
         last_day = last_day.strftime('%Y-%m-%d')
         
-        cursor.execute('''
-        SELECT user_id, 
-               COALESCE(username, first_name || ' ' || COALESCE(last_name, '')),
-               SUM(count) as total
-        FROM pushups 
-        WHERE date BETWEEN ? AND ?
-        GROUP BY user_id
-        ORDER BY total DESC
-        ''', (first_day, last_day))
-    else:
-        cursor.execute('''
-        SELECT user_id, 
-               COALESCE(username, first_name || ' ' || COALESCE(last_name, '')),
-               SUM(count) as total
-        FROM pushups 
-        GROUP BY user_id
-        ORDER BY total DESC
-        ''')
+        query += ' AND date BETWEEN ? AND ?'
+        params.extend([first_day, last_day])
     
+    # Группировка и сортировка
+    query += ' GROUP BY user_id ORDER BY total DESC'
+    
+    cursor.execute(query, params)
     results = cursor.fetchall()
     conn.close()
     
     total_all = sum([row[2] for row in results]) if results else 0
     return total_all, results
 
+# Получение статистики по всем упражнениям
+def get_all_exercises_statistics(period='all'):
+    stats = {}
+    for exercise in EXERCISES.keys():
+        total, results = get_statistics(exercise, period)
+        stats[exercise] = {
+            'total': total,
+            'results': results
+        }
+    return stats
+
+# Получение общего рейтинга (по местам в каждом упражнении)
+def get_overall_ranking(period='all'):
+    conn = sqlite3.connect('workouts.db')
+    cursor = conn.cursor()
+    
+    # Получаем всех пользователей
+    cursor.execute('''
+    SELECT DISTINCT user_id, 
+           COALESCE(username, first_name || ' ' || COALESCE(last_name, '')) as name
+    FROM workouts
+    ''')
+    
+    all_users = {row[0]: {'name': row[1], 'places': {}, 'total_points': 0} for row in cursor.fetchall()}
+    
+    # Для каждого упражнения определяем места
+    for exercise in EXERCISES.keys():
+        # Получаем статистику по упражнению
+        if period == 'month':
+            today = datetime.now()
+            first_day = today.replace(day=1).strftime('%Y-%m-%d')
+            last_day = (today.replace(month=today.month+1, day=1) - timedelta(days=1)).strftime('%Y-%m-%d')
+            
+            cursor.execute('''
+            SELECT user_id, SUM(count) as total
+            FROM workouts 
+            WHERE exercise_type = ? AND date BETWEEN ? AND ?
+            GROUP BY user_id
+            ORDER BY total DESC
+            ''', (exercise, first_day, last_day))
+        else:
+            cursor.execute('''
+            SELECT user_id, SUM(count) as total
+            FROM workouts 
+            WHERE exercise_type = ?
+            GROUP BY user_id
+            ORDER BY total DESC
+            ''', (exercise,))
+        
+        results = cursor.fetchall()
+        
+        # Присваиваем места
+        for place, (user_id, total) in enumerate(results, 1):
+            if place <= 3:  # Только первые 3 места дают очки
+                points = 4 - place  # 1 место = 3 очка, 2 место = 2 очка, 3 место = 1 очко
+                all_users[user_id]['total_points'] += points
+                
+            # Сохраняем место
+            if user_id in all_users:
+                all_users[user_id]['places'][exercise] = place
+    
+    conn.close()
+    
+    # Сортируем по общему количеству очков
+    sorted_users = sorted(
+        all_users.items(),
+        key=lambda x: (-x[1]['total_points'], x[1]['name'])
+    )
+    
+    return sorted_users
+
 # Главное меню с клавиатурой
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = """
-🏆 <b>Бот для учета отжиманий</b>
+🏆 <b>Бот для учета тренировок</b>
 
 Выберите действие с помощью кнопок ниже:
 
 <b>Основные функции:</b>
-🏋️ <b>Записать тренировку</b> - добавить сегодняшние отжимания
-📊 <b>Статистика</b> - общая статистика за всё время
+🏋️ <b>Записать тренировку</b> - добавить сегодняшние результаты
+📊 <b>Общая статистика</b> - статистика по всем упражнениям
 📈 <b>Текущий месяц</b> - статистика за этот месяц
-🏆 <b>Лидеры месяца</b> - топ участников текущего месяца
-🎉 <b>Победитель</b> - победитель текущего месяца
+🏆 <b>Лидеры по упражнениям</b> - топ участников по каждому упражнению
+🎉 <b>Общий победитель</b> - победитель в общем зачете
 
 <b>Личная статистика:</b>
 👤 <b>Моя статистика</b> - ваши личные результаты
 📅 <b>Сегодня</b> - статистика за сегодняшний день
+
+<b>📝 Доступные упражнения:</b>
+🏋️ <b>Отжимания</b> - количество раз
+🦵 <b>Приседания</b> - количество раз
+💪 <b>Подтягивания</b> - количество раз
+⏱️ <b>Планка</b> - время в секундах
 
 <b>🏆 Призы:</b>
 В конце месяца победитель получает 2000 рублей!
@@ -156,6 +259,7 @@ async def cancel_input_timeout(context: ContextTypes.DEFAULT_TYPE):
     # Сбрасываем состояние ожидания ввода
     context.user_data.pop('waiting_for_count', None)
     context.user_data.pop('input_start_time', None)
+    context.user_data.pop('selected_exercise', None)
     
     # Отправляем сообщение об отмене
     await context.bot.send_message(
@@ -171,14 +275,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text
     
-    # Проверяем, ожидаем ли мы ввод числа отжиманий
+    # Проверяем, ожидаем ли мы выбор упражнения
+    if context.user_data.get('waiting_for_exercise'):
+        await handle_exercise_selection(update, context)
+        return
+    
+    # Проверяем, ожидаем ли мы ввод числа
     if context.user_data.get('waiting_for_count'):
-        # Проверяем, не истекло ли время ожидания (5 секунд)
+        # Проверяем, не истекло ли время ожидания (30 секунд)
         input_start_time = context.user_data.get('input_start_time')
-        if input_start_time and time.time() - input_start_time > 5:
+        if input_start_time and time.time() - input_start_time > 30:
             # Время истекло, сбрасываем состояние
             context.user_data.pop('waiting_for_count', None)
             context.user_data.pop('input_start_time', None)
+            context.user_data.pop('selected_exercise', None)
             
             # Отменяем задание таймера если оно существует
             if 'timeout_job' in context.user_data:
@@ -194,25 +304,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         # Если время не истекло, обрабатываем ввод
-        await handle_pushup_count(update, context)
+        await handle_workout_count(update, context)
         return
     
     # Обрабатываем нажатия кнопок только если не ожидаем ввод
     await handle_button_press(update, context)
 
-# Обработчик нажатий кнопок
-async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Обработчик выбора упражнения
+async def handle_exercise_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     
-    if text == "🏋️ Записать тренировку":
-        # Устанавливаем состояние ожидания ввода
+    # Определяем выбранное упражнение по тексту кнопки
+    exercise_map = {
+        '🏋️ Отжимания': 'pushups',
+        '🦵 Приседания': 'squats',
+        '💪 Подтягивания': 'pullups',
+        '⏱️ Планка': 'plank'
+    }
+    
+    if text in exercise_map:
+        exercise = exercise_map[text]
+        exercise_name = EXERCISES[exercise]
+        
+        # Сохраняем выбранное упражнение
+        context.user_data['selected_exercise'] = exercise
+        context.user_data['waiting_for_exercise'] = False
         context.user_data['waiting_for_count'] = True
         context.user_data['input_start_time'] = time.time()
         
-        # Создаем задание для отмены по таймауту (5 секунд)
+        # Создаем задание для отмены по таймауту (30 секунд)
         job = context.job_queue.run_once(
             cancel_input_timeout,
-            when=5,
+            when=30,
             data={'user_id': update.effective_user.id},
             chat_id=update.effective_chat.id,
             name=f"input_timeout_{update.effective_user.id}"
@@ -221,96 +344,56 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Сохраняем задание для возможной отмены
         context.user_data['timeout_job'] = job
         
+        if exercise == 'plank':
+            message = f"⏱️ <b>Вы выбрали: {exercise_name}</b>\n\n"
+            message += "Введите время планки в <b>секундах</b>:\n"
+            message += "<i>Пример: 120 (это 2 минуты)</i>\n\n"
+        else:
+            message = f"🏋️ <b>Вы выбрали: {exercise_name}</b>\n\n"
+            message += "Введите количество повторений:\n"
+            message += "<i>Пример: 50</i>\n\n"
+        
+        message += "<i>У вас есть 30 секунд на ввод</i>\n"
+        message += "<i>Для отмены нажмите /cancel</i>"
+        
         await update.message.reply_text(
-            "💪 <b>Введите количество отжиманий:</b>\n\n"
-            "<i>Просто напишите число, например: 50</i>\n\n"
-            "<i>У вас есть 5 секунд на ввод</i>\n"
-            "<i>Для отмены нажмите /cancel</i>",
+            message,
             parse_mode=ParseMode.HTML,
             reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True)
         )
+    elif text == "/cancel":
+        await cancel(update, context)
+    else:
+        await update.message.reply_text(
+            "Пожалуйста, выберите упражнение из списка:",
+            reply_markup=EXERCISE_KEYBOARD
+        )
+
+# Обработчик нажатий кнопок главного меню
+async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
     
-    elif text == "📊 Статистика":
-        total, stats = get_statistics('all')
-        message = f"📊 <b>Статистика за всё время</b>\n\n"
-        message += f"<b>Всего отжиманий:</b> {total} раз\n\n"
+    if text == "🏋️ Записать тренировку":
+        # Устанавливаем состояние ожидания выбора упражнения
+        context.user_data['waiting_for_exercise'] = True
         
-        if stats:
-            for i, (user_id, name, user_total) in enumerate(stats, 1):
-                if i <= 10:
-                    message += f"{i}. {name} - {user_total} раз\n"
-            if len(stats) > 10:
-                message += f"\n...и ещё {len(stats) - 10} участников"
-        else:
-            message += "Пока нет данных об отжиманиях"
-        
-        await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            "🏋️ <b>Выберите упражнение:</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=EXERCISE_KEYBOARD
+        )
+    
+    elif text == "📊 Общая статистика":
+        await all_time_stats(update, context)
     
     elif text == "📈 Текущий месяц":
-        total, stats = get_statistics('month')
-        today = datetime.now()
-        month_name = today.strftime('%B %Y')
-        
-        message = f"📈 <b>Статистика за {month_name}</b>\n\n"
-        message += f"<b>Всего отжиманий:</b> {total} раз\n\n"
-        
-        if stats:
-            for i, (user_id, name, user_total) in enumerate(stats, 1):
-                if i <= 10:
-                    message += f"{i}. {name} - {user_total} раз\n"
-            if len(stats) > 10:
-                message += f"\n...и ещё {len(stats) - 10} участников"
-        else:
-            message += "Пока нет данных за этот месяц"
-        
-        await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+        await month_stats(update, context)
     
-    elif text == "🏆 Лидеры месяца":
-        total, stats = get_statistics('month')
-        today = datetime.now()
-        month_name = today.strftime('%B %Y')
-        
-        if stats:
-            message = f"🏆 <b>Лидеры {month_name}</b>\n\n"
-            
-            top_users = stats[:5]
-            
-            for i, (user_id, name, user_total) in enumerate(top_users, 1):
-                if i == 1:
-                    message += f"🥇 <b>{name}</b> - {user_total} отжиманий\n"
-                elif i == 2:
-                    message += f"🥈 <b>{name}</b> - {user_total} отжиманий\n"
-                elif i == 3:
-                    message += f"🥉 <b>{name}</b> - {user_total} отжиманий\n"
-                else:
-                    message += f"{i}. <b>{name}</b> - {user_total} отжиманий\n"
-            
-            message += f"\n<b>Всего участников:</b> {len(stats)}"
-            message += f"\n<b>Общее количество:</b> {total}"
-        else:
-            message = "📊 Пока нет данных за этот месяц"
-        
-        await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+    elif text == "🏆 Лидеры по упражнениям":
+        await exercise_leaders(update, context)
     
-    elif text == "🎉 Победитель":
-        total, stats = get_statistics('month')
-        
-        if stats:
-            winner_id, winner_name, winner_total = stats[0]
-            today = datetime.now()
-            month_name = today.strftime('%B %Y')
-            
-            message = (
-                f"🎉 <b>ПОБЕДИТЕЛЬ {month_name.upper()}</b>\n\n"
-                f"🥇 <b>{winner_name}</b>\n\n"
-                f"<b>Количество отжиманий:</b> {winner_total}\n"
-                f"<b>Приз:</b> 2000 рублей\n\n"
-                f"<i>Поздравляем победителя! 🎊</i>"
-            )
-        else:
-            message = "📊 Пока нет данных за этот месяц"
-        
-        await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+    elif text == "🎉 Общий победитель":
+        await overall_winner(update, context)
     
     elif text == "👤 Моя статистика":
         await my_stats(update, context)
@@ -320,46 +403,39 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     else:
         # Игнорируем все другие текстовые сообщения
-        # Не отправляем ответ, чтобы не засорять чат
         pass
 
-# Обработчик ввода отжиманий
-async def handle_pushup_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Обработчик ввода количества
+async def handle_workout_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text
     
     # Проверяем, не отмена ли это
     if text.lower() in ['/cancel', 'отмена', 'cancel']:
-        context.user_data.pop('waiting_for_count', None)
-        context.user_data.pop('input_start_time', None)
-        
-        # Отменяем задание таймера если оно существует
-        if 'timeout_job' in context.user_data:
-            context.user_data['timeout_job'].schedule_removal()
-            context.user_data.pop('timeout_job', None)
-        
-        await update.message.reply_text(
-            "❌ Запись отменена.",
-            reply_markup=MAIN_KEYBOARD
-        )
+        await cancel(update, context)
         return
     
     try:
-        count = int(text)
+        count = float(text)  # Используем float для планки (секунды могут быть дробными)
         if count <= 0:
             await update.message.reply_text(
                 "❌ <b>Число должно быть больше 0.</b>\n"
-                "Попробуйте еще раз (у вас 5 секунд):",
+                "Попробуйте еще раз (у вас 30 секунд):",
                 parse_mode=ParseMode.HTML
             )
             # Сбрасываем таймер для нового ввода
             context.user_data['input_start_time'] = time.time()
             return
         
-        if count > 10000:
+        # Проверяем максимальное значение
+        exercise = context.user_data.get('selected_exercise')
+        max_value = 10000 if exercise != 'plank' else 3600  # Для планки максимум 1 час
+        
+        if count > max_value:
+            unit = "секунд" if exercise == 'plank' else "раз"
             await update.message.reply_text(
-                "😮 <b>Слишком большое число!</b>\n"
-                "Пожалуйста, введите реальное количество (у вас 5 секунд):",
+                f"😮 <b>Слишком большое число!</b>\n"
+                f"Пожалуйста, введите реальное количество (у вас 30 секунд):",
                 parse_mode=ParseMode.HTML
             )
             # Сбрасываем таймер для нового ввода
@@ -367,23 +443,29 @@ async def handle_pushup_count(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         
         # Записываем в базу
-        add_pushups(
+        add_workout(
             user.id,
             user.username,
             user.first_name,
             user.last_name,
-            count
+            exercise,
+            int(count) if exercise != 'plank' else count
         )
         
         # Сбрасываем состояние и отменяем таймер
         context.user_data.pop('waiting_for_count', None)
         context.user_data.pop('input_start_time', None)
+        context.user_data.pop('selected_exercise', None)
         if 'timeout_job' in context.user_data:
             context.user_data['timeout_job'].schedule_removal()
             context.user_data.pop('timeout_job', None)
         
+        exercise_name = EXERCISES[exercise]
+        unit = "секунд" if exercise == 'plank' else "раз"
+        
         await update.message.reply_text(
-            f"✅ <b>Отлично! Записал {count} отжиманий за сегодня!</b>\n\n"
+            f"✅ <b>Отлично! Записал {exercise_name}:</b>\n"
+            f"<b>{count} {unit}</b>\n\n"
             f"<i>Продолжайте в том же духе! 💪</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=MAIN_KEYBOARD
@@ -391,9 +473,9 @@ async def handle_pushup_count(update: Update, context: ContextTypes.DEFAULT_TYPE
         
     except ValueError:
         await update.message.reply_text(
-            "❌ <b>Пожалуйста, введите целое число.</b>\n"
-            "Пример: 50\n\n"
-            "<i>У вас 5 секунд на ввод</i>\n"
+            "❌ <b>Пожалуйста, введите число.</b>\n"
+            "Пример: 50 (для планки можно использовать десятичные числа: 120.5)\n\n"
+            "<i>У вас 30 секунд на ввод</i>\n"
             "<i>Для отмены нажмите /cancel</i>",
             parse_mode=ParseMode.HTML
         )
@@ -402,42 +484,42 @@ async def handle_pushup_count(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # Команда отмены
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get('waiting_for_count'):
-        context.user_data.pop('waiting_for_count', None)
-        context.user_data.pop('input_start_time', None)
-        
-        # Отменяем задание таймера если оно существует
-        if 'timeout_job' in context.user_data:
-            context.user_data['timeout_job'].schedule_removal()
-            context.user_data.pop('timeout_job', None)
-        
-        await update.message.reply_text(
-            "✅ Запись отменена.",
-            reply_markup=MAIN_KEYBOARD
-        )
-    else:
-        await update.message.reply_text(
-            "Нет активной операции для отмены.",
-            reply_markup=MAIN_KEYBOARD
-        )
+    # Сбрасываем все состояния
+    context.user_data.pop('waiting_for_exercise', None)
+    context.user_data.pop('waiting_for_count', None)
+    context.user_data.pop('input_start_time', None)
+    context.user_data.pop('selected_exercise', None)
+    
+    # Отменяем задание таймера если оно существует
+    if 'timeout_job' in context.user_data:
+        context.user_data['timeout_job'].schedule_removal()
+        context.user_data.pop('timeout_job', None)
+    
+    await update.message.reply_text(
+        "✅ Операция отменена.",
+        reply_markup=MAIN_KEYBOARD
+    )
 
 # Личная статистика пользователя
 async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    conn = sqlite3.connect('pushups.db')
+    conn = sqlite3.connect('workouts.db')
     cursor = conn.cursor()
     
-    # Общая статистика
+    # Общая статистика по всем упражнениям
     cursor.execute('''
-    SELECT SUM(count) as total,
+    SELECT exercise_type, 
+           SUM(count) as total,
            COUNT(DISTINCT date) as days,
            AVG(count) as average,
            MAX(count) as max_count
-    FROM pushups 
+    FROM workouts 
     WHERE user_id = ?
+    GROUP BY exercise_type
+    ORDER BY exercise_type
     ''', (user.id,))
     
-    total_stats = cursor.fetchone()
+    exercise_stats = cursor.fetchall()
     
     # Статистика за месяц
     today = datetime.now()
@@ -445,151 +527,272 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_day = (today.replace(month=today.month+1, day=1) - timedelta(days=1)).strftime('%Y-%m-%d')
     
     cursor.execute('''
-    SELECT SUM(count) as month_total,
-           COUNT(DISTINCT date) as month_days
-    FROM pushups 
+    SELECT exercise_type, SUM(count) as month_total
+    FROM workouts 
     WHERE user_id = ? AND date BETWEEN ? AND ?
+    GROUP BY exercise_type
     ''', (user.id, first_day, last_day))
     
-    month_stats = cursor.fetchone()
+    month_stats = dict(cursor.fetchall())
     
     # Статистика за сегодня
     today_str = today.strftime('%Y-%m-%d')
     cursor.execute('''
-    SELECT SUM(count) as today_total
-    FROM pushups 
+    SELECT exercise_type, SUM(count) as today_total
+    FROM workouts 
     WHERE user_id = ? AND date = ?
+    GROUP BY exercise_type
     ''', (user.id, today_str))
     
-    today_stats = cursor.fetchone()
-    
-    # Место в рейтинге за месяц
-    cursor.execute('''
-    SELECT user_id, SUM(count) as total
-    FROM pushups 
-    WHERE date BETWEEN ? AND ?
-    GROUP BY user_id
-    ORDER BY total DESC
-    ''', (first_day, last_day))
-    
-    month_ranking = cursor.fetchall()
-    user_rank = None
-    for i, (uid, total) in enumerate(month_ranking, 1):
-        if uid == user.id:
-            user_rank = i
-            break
+    today_stats = dict(cursor.fetchall())
     
     conn.close()
-    
-    total = total_stats[0] or 0
-    days = total_stats[1] or 0
-    average = total_stats[2] or 0
-    max_count = total_stats[3] or 0
-    month_total = month_stats[0] or 0
-    month_days = month_stats[1] or 0
-    today_total = today_stats[0] or 0
     
     user_name = user.username or user.first_name or "Участник"
     
     message = f"👤 <b>Личная статистика {user_name}</b>\n\n"
     
-    message += f"<b>Сегодня:</b> {int(today_total)} отжиманий\n"
-    message += f"<b>В этом месяце:</b> {int(month_total)} ({month_days} дней)\n"
-    if user_rank:
-        message += f"<b>Место в рейтинге:</b> {user_rank}\n"
-    message += f"<b>Всего отжиманий:</b> {int(total)}\n"
-    message += f"<b>Тренировочных дней:</b> {days}\n"
-    if days > 0:
-        message += f"<b>Среднее за тренировку:</b> {int(average)}\n"
-        message += f"<b>Рекорд за раз:</b> {int(max_count)}\n"
+    # Статистика за сегодня
+    if today_stats:
+        message += "<b>Сегодня:</b>\n"
+        for exercise, total in today_stats.items():
+            exercise_name = EXERCISES.get(exercise, exercise)
+            unit = "секунд" if exercise == 'plank' else "раз"
+            message += f"  {exercise_name}: {int(total) if exercise != 'plank' else total} {unit}\n"
+        message += "\n"
     
-    if days > 0:
-        message += f"\n<b>Продолжайте в том же духе! 💪</b>"
+    # Статистика за месяц
+    if month_stats:
+        message += "<b>В этом месяце:</b>\n"
+        for exercise, total in month_stats.items():
+            exercise_name = EXERCISES.get(exercise, exercise)
+            unit = "секунд" if exercise == 'plank' else "раз"
+            message += f"  {exercise_name}: {int(total) if exercise != 'plank' else total} {unit}\n"
+        message += "\n"
+    
+    # Общая статистика по упражнениям
+    if exercise_stats:
+        message += "<b>Общая статистика:</b>\n"
+        for exercise_type, total, days, average, max_count in exercise_stats:
+            exercise_name = EXERCISES.get(exercise_type, exercise_type)
+            unit = "секунд" if exercise_type == 'plank' else "раз"
+            message += f"\n<b>{exercise_name}:</b>\n"
+            message += f"  Всего: {int(total) if exercise_type != 'plank' else total} {unit}\n"
+            message += f"  Дней тренировок: {days}\n"
+            if days > 0:
+                message += f"  Среднее: {int(average) if exercise_type != 'plank' else round(average, 1)} {unit}\n"
+                message += f"  Максимум: {int(max_count) if exercise_type != 'plank' else max_count} {unit}\n"
+    
+    if not exercise_stats:
+        message += "У вас пока нет записанных тренировок.\n"
+        message += "Начните свою первую тренировку! 🏃‍♂️"
     else:
-        message += f"\n<b>Начните свою первую тренировку! 🏃‍♂️</b>"
+        message += "\n<b>Продолжайте в том же духе! 💪</b>"
     
     await update.message.reply_text(message, parse_mode=ParseMode.HTML)
 
 # Статистика за сегодня
 async def today_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = sqlite3.connect('pushups.db')
+    conn = sqlite3.connect('workouts.db')
     cursor = conn.cursor()
     
     today = datetime.now().strftime('%Y-%m-%d')
     
+    # Получаем статистику по упражнениям за сегодня
     cursor.execute('''
-    SELECT COALESCE(username, first_name || ' ' || COALESCE(last_name, '')),
+    SELECT exercise_type,
+           COALESCE(username, first_name || ' ' || COALESCE(last_name, '')),
            SUM(count) as total
-    FROM pushups 
+    FROM workouts 
     WHERE date = ?
-    GROUP BY user_id
-    ORDER BY total DESC
+    GROUP BY exercise_type, user_id
+    ORDER BY exercise_type, total DESC
     ''', (today,))
     
     results = cursor.fetchall()
     conn.close()
     
-    total_today = sum([row[1] for row in results]) if results else 0
+    # Группируем по упражнениям
+    grouped = {}
+    for exercise_type, name, total in results:
+        if exercise_type not in grouped:
+            grouped[exercise_type] = []
+        grouped[exercise_type].append((name, total))
     
     message = f"📅 <b>Статистика за сегодня ({today})</b>\n\n"
-    message += f"<b>Всего отжиманий:</b> {total_today} раз\n\n"
     
-    if results:
-        message += "<b>Участники:</b>\n"
-        for i, (name, user_total) in enumerate(results, 1):
-            if i <= 10:
-                message += f"{i}. {name} - {user_total} раз\n"
-        if len(results) > 10:
-            message += f"\n...и ещё {len(results) - 10} участников"
+    if grouped:
+        for exercise_type, users in grouped.items():
+            exercise_name = EXERCISES.get(exercise_type, exercise_type)
+            unit = "секунд" if exercise_type == 'plank' else "раз"
+            
+            message += f"<b>{exercise_name}:</b>\n"
+            total_exercise = sum(total for _, total in users)
+            message += f"<i>Всего: {int(total_exercise) if exercise_type != 'plank' else total_exercise} {unit}</i>\n\n"
+            
+            for i, (name, user_total) in enumerate(users[:5], 1):
+                message += f"{i}. {name} - {int(user_total) if exercise_type != 'plank' else user_total} {unit}\n"
+            
+            if len(users) > 5:
+                message += f"...и ещё {len(users) - 5} участников\n"
+            
+            message += "\n"
     else:
-        message += "Сегодня еще никто не делал отжимания 😴\n\n"
+        message += "Сегодня еще никто не тренировался 😴\n\n"
         message += "Будьте первым! 💪"
+    
+    await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+# Статистика за все время
+async def all_time_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stats = get_all_exercises_statistics('all')
+    
+    message = "📊 <b>Общая статистика за всё время</b>\n\n"
+    
+    for exercise_type, data in stats.items():
+        exercise_name = EXERCISES.get(exercise_type, exercise_type)
+        unit = "секунд" if exercise_type == 'plank' else "раз"
+        
+        message += f"<b>{exercise_name}:</b>\n"
+        message += f"<i>Всего: {int(data['total']) if exercise_type != 'plank' else data['total']} {unit}</i>\n\n"
+        
+        if data['results']:
+            for i, (user_id, name, total) in enumerate(data['results'][:5], 1):
+                message += f"{i}. {name} - {int(total) if exercise_type != 'plank' else total} {unit}\n"
+            
+            if len(data['results']) > 5:
+                message += f"...и ещё {len(data['results']) - 5} участников\n"
+        else:
+            message += "Нет данных\n"
+        
+        message += "\n"
+    
+    await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+# Статистика за текущий месяц
+async def month_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stats = get_all_exercises_statistics('month')
+    today = datetime.now()
+    month_name = today.strftime('%B %Y')
+    
+    message = f"📈 <b>Статистика за {month_name}</b>\n\n"
+    
+    for exercise_type, data in stats.items():
+        exercise_name = EXERCISES.get(exercise_type, exercise_type)
+        unit = "секунд" if exercise_type == 'plank' else "раз"
+        
+        message += f"<b>{exercise_name}:</b>\n"
+        message += f"<i>Всего: {int(data['total']) if exercise_type != 'plank' else data['total']} {unit}</i>\n\n"
+        
+        if data['results']:
+            for i, (user_id, name, total) in enumerate(data['results'][:5], 1):
+                message += f"{i}. {name} - {int(total) if exercise_type != 'plank' else total} {unit}\n"
+            
+            if len(data['results']) > 5:
+                message += f"...и ещё {len(data['results']) - 5} участников\n"
+        else:
+            message += "Нет данных\n"
+        
+        message += "\n"
+    
+    await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+# Лидеры по упражнениям
+async def exercise_leaders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stats = get_all_exercises_statistics('month')
+    today = datetime.now()
+    month_name = today.strftime('%B %Y')
+    
+    message = f"🏆 <b>Лидеры по упражнениям ({month_name})</b>\n\n"
+    
+    for exercise_type, data in stats.items():
+        exercise_name = EXERCISES.get(exercise_type, exercise_type)
+        unit = "секунд" if exercise_type == 'plank' else "раз"
+        
+        if data['results']:
+            message += f"<b>{exercise_name}:</b>\n"
+            
+            # Показываем топ-3 с медалями
+            top_users = data['results'][:3]
+            
+            for i, (user_id, name, total) in enumerate(top_users, 1):
+                if i == 1:
+                    message += f"🥇 {name} - {int(total) if exercise_type != 'plank' else total} {unit}\n"
+                elif i == 2:
+                    message += f"🥈 {name} - {int(total) if exercise_type != 'plank' else total} {unit}\n"
+                elif i == 3:
+                    message += f"🥉 {name} - {int(total) if exercise_type != 'plank' else total} {unit}\n"
+            
+            message += "\n"
+    
+    await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+# Общий победитель
+async def overall_winner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ranking = get_overall_ranking('month')
+    today = datetime.now()
+    month_name = today.strftime('%B %Y')
+    
+    message = f"🎉 <b>Общий зачет ({month_name})</b>\n\n"
+    message += "<i>Система подсчета: 3 очка за 1 место, 2 за 2, 1 за 3</i>\n\n"
+    
+    if ranking:
+        # Показываем топ-5
+        for i, (user_id, data) in enumerate(ranking[:5], 1):
+            name = data['name']
+            points = data['total_points']
+            
+            if i == 1:
+                message += f"🥇 <b>{name}</b> - {points} очков\n"
+            elif i == 2:
+                message += f"🥈 <b>{name}</b> - {points} очков\n"
+            elif i == 3:
+                message += f"🥉 <b>{name}</b> - {points} очков\n"
+            else:
+                message += f"{i}. <b>{name}</b> - {points} очков\n"
+            
+            # Показываем места по упражнениям
+            places_text = []
+            for exercise, place in data['places'].items():
+                exercise_name = EXERCISES.get(exercise, exercise)
+                places_text.append(f"{exercise_name}: {place}")
+            
+            if places_text:
+                message += f"   <i>({', '.join(places_text)})</i>\n"
+        
+        message += "\n<b>Победитель получает приз: 2000 рублей! 🏆</b>"
+    else:
+        message += "Пока нет данных для определения победителя.\n"
+        message += "Начните тренировки! 💪"
     
     await update.message.reply_text(message, parse_mode=ParseMode.HTML)
 
 # Команда для еженедельного лидерборда
 async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    total, stats = get_statistics('month')
+    ranking = get_overall_ranking('month')
     today = datetime.now()
     month_name = today.strftime('%B %Y')
     
-    if stats:
-        message = f"🏆 <b>Еженедельный лидерборд {month_name}</b>\n\n"
-        
-        top_users = stats[:5]
-        
-        for i, (user_id, name, user_total) in enumerate(top_users, 1):
-            if i == 1:
-                message += f"🥇 <b>{name}</b> - {user_total} отжиманий\n"
-            elif i == 2:
-                message += f"🥈 <b>{name}</b> - {user_total} отжиманий\n"
-            elif i == 3:
-                message += f"🥉 <b>{name}</b> - {user_total} отжиманий\n"
-            else:
-                message += f"{i}. <b>{name}</b> - {user_total} отжиманий\n"
-        
-        message += f"\n<b>Всего участников:</b> {len(stats)}"
-        message += f"\n<b>Общее количество:</b> {total}"
-        
-        await update.message.reply_text(message, parse_mode=ParseMode.HTML)
-    else:
-        await update.message.reply_text("📊 Пока нет данных за этот месяц")
-
-# Команда для общего рейтинга
-async def all_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    total, stats = get_statistics('all')
-    message = f"📊 <b>Общий рейтинг за всё время</b>\n\n"
-    message += f"<b>Всего отжиманий:</b> {total} раз\n\n"
+    message = f"🏆 <b>Еженедельный лидерборд ({month_name})</b>\n\n"
     
-    if stats:
-        message += "<b>Топ-10 участников:</b>\n"
-        for i, (user_id, name, user_total) in enumerate(stats[:10], 1):
-            message += f"{i}. {name} - {user_total} раз\n"
-        
-        if len(stats) > 10:
-            message += f"\n...и ещё {len(stats) - 10} участников"
+    if ranking:
+        # Показываем топ-5
+        for i, (user_id, data) in enumerate(ranking[:5], 1):
+            name = data['name']
+            points = data['total_points']
+            
+            if i == 1:
+                message += f"🥇 <b>{name}</b> - {points} очков\n"
+            elif i == 2:
+                message += f"🥈 <b>{name}</b> - {points} очков\n"
+            elif i == 3:
+                message += f"🥉 <b>{name}</b> - {points} очков\n"
+            else:
+                message += f"{i}. <b>{name}</b> - {points} очков\n"
     else:
-        message += "Пока нет данных об отжиманиях"
+        message += "Пока нет данных для лидерборда.\n"
+    
+    message += "\n<i>Не сдавайтесь! Каждая тренировка приближает вас к победе! 💪</i>"
     
     await update.message.reply_text(message, parse_mode=ParseMode.HTML)
 
@@ -601,31 +804,27 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /start - Показать главное меню с клавиатурой
 /help - Эта справка
 /weekly - Еженедельный лидерборд
-/allstats - Общий рейтинг за всё время
 /cancel - Отменить текущее действие
 
 <b>🎯 Как пользоваться:</b>
 1. Используйте кнопки внизу экрана
 2. Нажмите "Записать тренировку"
-3. Введите количество отжиманий в течение 5 секунд
-4. Смотрите статистику через кнопки
+3. Выберите упражнение
+4. Введите количество в течение 30 секунд
+5. Смотрите статистику через кнопки
+
+<b>📝 Упражнения:</b>
+🏋️ <b>Отжимания</b> - количество раз
+🦵 <b>Приседания</b> - количество раз  
+💪 <b>Подтягивания</b> - количество раз
+⏱️ <b>Планка</b> - время в секундах
 
 <b>🏆 Призы:</b>
-В конце месяца победитель получает 2000 рублей!
+В конце месяца победитель в общем зачете получает 2000 рублей!
 
 <b>📱 Кнопки всегда под рукой!</b>
 """
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
-
-# Команда для сброса базы данных (только для администратора)
-async def reset_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    # Замените '@Kovalevev' на ваш ID
-    if str(user.id) == '@Kovalevev':  
-        init_db()
-        await update.message.reply_text("✅ База данных сброшена")
-    else:
-        await update.message.reply_text("❌ У вас нет прав для этой команды")
 
 # Главная функция
 def main():
@@ -639,9 +838,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("weekly", weekly))
-    application.add_handler(CommandHandler("allstats", all_stats))
     application.add_handler(CommandHandler("cancel", cancel))
-    application.add_handler(CommandHandler("reset", reset_db))
     
     # Обработчик всех текстовых сообщений
     application.add_handler(
@@ -653,14 +850,14 @@ def main():
     
     # Запуск бота
     print("=" * 50)
-    print("🤖 Бот для учета отжиманий запущен!")
+    print("🤖 Бот для учета тренировок запущен!")
     print("📱 Работает на Android через Pydroid 3")
     print("=" * 50)
     print("\n🎯 Особенности этой версии:")
+    print("✅ 4 упражнения: отжимания, приседания, подтягивания, планка")
     print("✅ Постоянная клавиатура внизу экрана")
-    print("✅ Проверка ввода только при ожидании числа")
-    print("✅ Таймаут 5 секунд на ввод отжиманий")
-    print("✅ Остальные сообщения игнорируются")
+    print("✅ Общий зачет по системе очков (3-2-1)")
+    print("✅ Подробная статистика по каждому упражнению")
     print("=" * 50)
     print("\n💡 Совет:")
     print("1. Добавьте бота в группу")
