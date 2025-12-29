@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timedelta
 import asyncio
 import time
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, 
     CommandHandler, 
@@ -29,8 +29,29 @@ EXERCISES = {
     'pushups': '🏋️ Отжимания',
     'squats': '🦵 Приседания', 
     'pullups': '💪 Подтягивания',
-    'plank': '⏱️ Планка'
+    'plank': '⏱️ Планка',
+    'leg_raises': '🦵 Подъем ног'
 }
+
+# Сопоставление username с именами
+USERNAME_TO_NAME = {
+    'Cryptocentur': 'Бах',
+    'H1ery': 'Никитос',
+    'Kovalevev': 'Женя'
+}
+
+# Функция для получения отображаемого имени
+def get_display_name(username, first_name, last_name):
+    if username in USERNAME_TO_NAME:
+        return USERNAME_TO_NAME[username]
+    elif username:
+        return username
+    elif first_name and last_name:
+        return f"{first_name} {last_name}"
+    elif first_name:
+        return first_name
+    else:
+        return "Участник"
 
 # Главная клавиатура
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
@@ -49,7 +70,7 @@ EXERCISE_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["🏋️ Отжимания", "🦵 Приседания"],
         ["💪 Подтягивания", "⏱️ Планка"],
-        ["/cancel"]
+        ["🦵 Подъем ног", "/cancel"]
     ],
     resize_keyboard=True
 )
@@ -109,9 +130,7 @@ def get_statistics(exercise_type=None, period='all'):
     
     # Базовый запрос
     query = '''
-    SELECT user_id, 
-           COALESCE(username, first_name || ' ' || COALESCE(last_name, '')),
-           SUM(count) as total
+    SELECT user_id, username, first_name, last_name, SUM(count) as total
     FROM workouts 
     WHERE 1=1
     '''
@@ -143,8 +162,14 @@ def get_statistics(exercise_type=None, period='all'):
     results = cursor.fetchall()
     conn.close()
     
-    total_all = sum([row[2] for row in results]) if results else 0
-    return total_all, results
+    # Преобразуем результаты с использованием get_display_name
+    formatted_results = []
+    for user_id, username, first_name, last_name, total in results:
+        display_name = get_display_name(username, first_name, last_name)
+        formatted_results.append((user_id, display_name, total))
+    
+    total_all = sum([row[2] for row in formatted_results]) if formatted_results else 0
+    return total_all, formatted_results
 
 # Получение статистики по всем упражнениям
 def get_all_exercises_statistics(period='all'):
@@ -157,21 +182,40 @@ def get_all_exercises_statistics(period='all'):
         }
     return stats
 
-# Получение общего рейтинга (по местам в каждом упражнении)
+# Получение общего рейтинга по новой системе баллов
 def get_overall_ranking(period='all'):
     conn = sqlite3.connect('workouts.db')
     cursor = conn.cursor()
     
-    # Получаем всех пользователей
-    cursor.execute('''
-    SELECT DISTINCT user_id, 
-           COALESCE(username, first_name || ' ' || COALESCE(last_name, '')) as name
-    FROM workouts
-    ''')
+    # Получаем всех пользователей с тренировками за период
+    if period == 'month':
+        today = datetime.now()
+        first_day = today.replace(day=1).strftime('%Y-%m-%d')
+        last_day = (today.replace(month=today.month+1, day=1) - timedelta(days=1)).strftime('%Y-%m-%d')
+        
+        cursor.execute('''
+        SELECT DISTINCT user_id, username, first_name, last_name
+        FROM workouts 
+        WHERE date BETWEEN ? AND ?
+        ''', (first_day, last_day))
+    else:
+        cursor.execute('''
+        SELECT DISTINCT user_id, username, first_name, last_name
+        FROM workouts
+        ''')
     
-    all_users = {row[0]: {'name': row[1], 'places': {}, 'total_points': 0} for row in cursor.fetchall()}
+    all_users_data = cursor.fetchall()
     
-    # Для каждого упражнения определяем места
+    # Создаем словарь для хранения данных пользователей
+    all_users = {}
+    for user_id, username, first_name, last_name in all_users_data:
+        display_name = get_display_name(username, first_name, last_name)
+        all_users[user_id] = {
+            'name': display_name,
+            'points': 0
+        }
+    
+    # Для каждого упражнения определяем места и начисляем баллы
     for exercise in EXERCISES.keys():
         # Получаем статистику по упражнению
         if period == 'month':
@@ -180,7 +224,7 @@ def get_overall_ranking(period='all'):
             last_day = (today.replace(month=today.month+1, day=1) - timedelta(days=1)).strftime('%Y-%m-%d')
             
             cursor.execute('''
-            SELECT user_id, SUM(count) as total
+            SELECT user_id, username, first_name, last_name, SUM(count) as total
             FROM workouts 
             WHERE exercise_type = ? AND date BETWEEN ? AND ?
             GROUP BY user_id
@@ -188,7 +232,7 @@ def get_overall_ranking(period='all'):
             ''', (exercise, first_day, last_day))
         else:
             cursor.execute('''
-            SELECT user_id, SUM(count) as total
+            SELECT user_id, username, first_name, last_name, SUM(count) as total
             FROM workouts 
             WHERE exercise_type = ?
             GROUP BY user_id
@@ -197,29 +241,56 @@ def get_overall_ranking(period='all'):
         
         results = cursor.fetchall()
         
-        # Присваиваем места
-        for place, (user_id, total) in enumerate(results, 1):
-            if place <= 3:  # Только первые 3 места дают очки
-                points = 4 - place  # 1 место = 3 очка, 2 место = 2 очка, 3 место = 1 очко
-                all_users[user_id]['total_points'] += points
-                
-            # Сохраняем место
+        # Присваиваем места и начисляем баллы
+        for place, (user_id, username, first_name, last_name, total) in enumerate(results, 1):
             if user_id in all_users:
-                all_users[user_id]['places'][exercise] = place
+                # Новая система баллов: 10 место = 0, 9 = 10, 8 = 20, ..., 1 = 90
+                # Формула: баллы = max(0, (10 - место) * 10)
+                points = max(0, (10 - place) * 10)
+                all_users[user_id]['points'] += points
     
     conn.close()
     
-    # Сортируем по общему количеству очков
+    # Сортируем по количеству баллов (убыванию)
     sorted_users = sorted(
         all_users.items(),
-        key=lambda x: (-x[1]['total_points'], x[1]['name'])
+        key=lambda x: (-x[1]['points'], x[1]['name'])
     )
     
     return sorted_users
 
-# Главное меню с клавиатурой
+# Главное меню без клавиатуры (скрытая)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = """
+🏆 <b>Бот для учета тренировок</b>
+
+Используйте команду /menu чтобы показать клавиатуру с кнопками.
+
+<b>📋 Доступные команды:</b>
+/menu - Показать клавиатуру с кнопками
+/help - Справка по командам
+/weekly - Еженедельный лидерборд
+/cancel - Отменить текущее действие
+
+<b>📝 Доступные упражнения:</b>
+🏋️ <b>Отжимания</b> - количество раз
+🦵 <b>Приседания</b> - количество раз
+💪 <b>Подтягивания</b> - количество раз
+⏱️ <b>Планка</b> - время в секундах
+🦵 <b>Подъем ног</b> - количество раз
+
+<b>🏆 Призы:</b>
+В конце месяца победитель получает 2000 рублей!
+"""
+    
+    await update.message.reply_text(
+        welcome_text,
+        parse_mode=ParseMode.HTML
+    )
+
+# Команда для показа клавиатуры
+async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_text = """
 🏆 <b>Бот для учета тренировок</b>
 
 Выберите действие с помощью кнопок ниже:
@@ -234,19 +305,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 <b>Личная статистика:</b>
 👤 <b>Моя статистика</b> - ваши личные результаты
 📅 <b>Сегодня</b> - статистика за сегодняшний день
-
-<b>📝 Доступные упражнения:</b>
-🏋️ <b>Отжимания</b> - количество раз
-🦵 <b>Приседания</b> - количество раз
-💪 <b>Подтягивания</b> - количество раз
-⏱️ <b>Планка</b> - время в секундах
-
-<b>🏆 Призы:</b>
-В конце месяца победитель получает 2000 рублей!
 """
     
     await update.message.reply_text(
-        welcome_text,
+        menu_text,
         reply_markup=MAIN_KEYBOARD,
         parse_mode=ParseMode.HTML
     )
@@ -319,7 +381,8 @@ async def handle_exercise_selection(update: Update, context: ContextTypes.DEFAUL
         '🏋️ Отжимания': 'pushups',
         '🦵 Приседания': 'squats',
         '💪 Подтягивания': 'pullups',
-        '⏱️ Планка': 'plank'
+        '⏱️ Планка': 'plank',
+        '🦵 Подъем ног': 'leg_raises'
     }
     
     if text in exercise_map:
@@ -548,7 +611,7 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     conn.close()
     
-    user_name = user.username or user.first_name or "Участник"
+    user_name = get_display_name(user.username, user.first_name, user.last_name)
     
     message = f"👤 <b>Личная статистика {user_name}</b>\n\n"
     
@@ -558,7 +621,8 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for exercise, total in today_stats.items():
             exercise_name = EXERCISES.get(exercise, exercise)
             unit = "секунд" if exercise == 'plank' else "раз"
-            message += f"  {exercise_name}: {int(total) if exercise != 'plank' else total} {unit}\n"
+            display_total = int(total) if exercise != 'plank' else total
+            message += f"  {exercise_name}: {display_total} {unit}\n"
         message += "\n"
     
     # Статистика за месяц
@@ -567,7 +631,8 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for exercise, total in month_stats.items():
             exercise_name = EXERCISES.get(exercise, exercise)
             unit = "секунд" if exercise == 'plank' else "раз"
-            message += f"  {exercise_name}: {int(total) if exercise != 'plank' else total} {unit}\n"
+            display_total = int(total) if exercise != 'plank' else total
+            message += f"  {exercise_name}: {display_total} {unit}\n"
         message += "\n"
     
     # Общая статистика по упражнениям
@@ -577,11 +642,14 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             exercise_name = EXERCISES.get(exercise_type, exercise_type)
             unit = "секунд" if exercise_type == 'plank' else "раз"
             message += f"\n<b>{exercise_name}:</b>\n"
-            message += f"  Всего: {int(total) if exercise_type != 'plank' else total} {unit}\n"
+            display_total = int(total) if exercise_type != 'plank' else total
+            message += f"  Всего: {display_total} {unit}\n"
             message += f"  Дней тренировок: {days}\n"
             if days > 0:
-                message += f"  Среднее: {int(average) if exercise_type != 'plank' else round(average, 1)} {unit}\n"
-                message += f"  Максимум: {int(max_count) if exercise_type != 'plank' else max_count} {unit}\n"
+                display_avg = int(average) if exercise_type != 'plank' else round(average, 1)
+                display_max = int(max_count) if exercise_type != 'plank' else max_count
+                message += f"  Среднее: {display_avg} {unit}\n"
+                message += f"  Максимум: {display_max} {unit}\n"
     
     if not exercise_stats:
         message += "У вас пока нет записанных тренировок.\n"
@@ -600,9 +668,7 @@ async def today_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Получаем статистику по упражнениям за сегодня
     cursor.execute('''
-    SELECT exercise_type,
-           COALESCE(username, first_name || ' ' || COALESCE(last_name, '')),
-           SUM(count) as total
+    SELECT exercise_type, username, first_name, last_name, SUM(count) as total
     FROM workouts 
     WHERE date = ?
     GROUP BY exercise_type, user_id
@@ -614,10 +680,11 @@ async def today_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Группируем по упражнениям
     grouped = {}
-    for exercise_type, name, total in results:
+    for exercise_type, username, first_name, last_name, total in results:
         if exercise_type not in grouped:
             grouped[exercise_type] = []
-        grouped[exercise_type].append((name, total))
+        display_name = get_display_name(username, first_name, last_name)
+        grouped[exercise_type].append((display_name, total))
     
     message = f"📅 <b>Статистика за сегодня ({today})</b>\n\n"
     
@@ -628,13 +695,15 @@ async def today_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             message += f"<b>{exercise_name}:</b>\n"
             total_exercise = sum(total for _, total in users)
-            message += f"<i>Всего: {int(total_exercise) if exercise_type != 'plank' else total_exercise} {unit}</i>\n\n"
+            display_total = int(total_exercise) if exercise_type != 'plank' else total_exercise
+            message += f"<i>Всего: {display_total} {unit}</i>\n\n"
             
-            for i, (name, user_total) in enumerate(users[:5], 1):
-                message += f"{i}. {name} - {int(user_total) if exercise_type != 'plank' else user_total} {unit}\n"
+            for i, (name, user_total) in enumerate(users[:10], 1):
+                display_user_total = int(user_total) if exercise_type != 'plank' else user_total
+                message += f"{i}. {name} - {display_user_total} {unit}\n"
             
-            if len(users) > 5:
-                message += f"...и ещё {len(users) - 5} участников\n"
+            if len(users) > 10:
+                message += f"...и ещё {len(users) - 10} участников\n"
             
             message += "\n"
     else:
@@ -654,14 +723,16 @@ async def all_time_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         unit = "секунд" if exercise_type == 'plank' else "раз"
         
         message += f"<b>{exercise_name}:</b>\n"
-        message += f"<i>Всего: {int(data['total']) if exercise_type != 'plank' else data['total']} {unit}</i>\n\n"
+        display_total = int(data['total']) if exercise_type != 'plank' else data['total']
+        message += f"<i>Всего: {display_total} {unit}</i>\n\n"
         
         if data['results']:
-            for i, (user_id, name, total) in enumerate(data['results'][:5], 1):
-                message += f"{i}. {name} - {int(total) if exercise_type != 'plank' else total} {unit}\n"
+            for i, (user_id, name, total) in enumerate(data['results'][:10], 1):
+                display_user_total = int(total) if exercise_type != 'plank' else total
+                message += f"{i}. {name} - {display_user_total} {unit}\n"
             
-            if len(data['results']) > 5:
-                message += f"...и ещё {len(data['results']) - 5} участников\n"
+            if len(data['results']) > 10:
+                message += f"...и ещё {len(data['results']) - 10} участников\n"
         else:
             message += "Нет данных\n"
         
@@ -682,14 +753,16 @@ async def month_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         unit = "секунд" if exercise_type == 'plank' else "раз"
         
         message += f"<b>{exercise_name}:</b>\n"
-        message += f"<i>Всего: {int(data['total']) if exercise_type != 'plank' else data['total']} {unit}</i>\n\n"
+        display_total = int(data['total']) if exercise_type != 'plank' else data['total']
+        message += f"<i>Всего: {display_total} {unit}</i>\n\n"
         
         if data['results']:
-            for i, (user_id, name, total) in enumerate(data['results'][:5], 1):
-                message += f"{i}. {name} - {int(total) if exercise_type != 'plank' else total} {unit}\n"
+            for i, (user_id, name, total) in enumerate(data['results'][:10], 1):
+                display_user_total = int(total) if exercise_type != 'plank' else total
+                message += f"{i}. {name} - {display_user_total} {unit}\n"
             
-            if len(data['results']) > 5:
-                message += f"...и ещё {len(data['results']) - 5} участников\n"
+            if len(data['results']) > 10:
+                message += f"...и ещё {len(data['results']) - 10} участников\n"
         else:
             message += "Нет данных\n"
         
@@ -716,31 +789,36 @@ async def exercise_leaders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             top_users = data['results'][:3]
             
             for i, (user_id, name, total) in enumerate(top_users, 1):
+                display_user_total = int(total) if exercise_type != 'plank' else total
                 if i == 1:
-                    message += f"🥇 {name} - {int(total) if exercise_type != 'plank' else total} {unit}\n"
+                    message += f"🥇 {name} - {display_user_total} {unit}\n"
                 elif i == 2:
-                    message += f"🥈 {name} - {int(total) if exercise_type != 'plank' else total} {unit}\n"
+                    message += f"🥈 {name} - {display_user_total} {unit}\n"
                 elif i == 3:
-                    message += f"🥉 {name} - {int(total) if exercise_type != 'plank' else total} {unit}\n"
+                    message += f"🥉 {name} - {display_user_total} {unit}\n"
             
             message += "\n"
     
     await update.message.reply_text(message, parse_mode=ParseMode.HTML)
 
-# Общий победитель
+# Общий победитель по новой системе
 async def overall_winner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ranking = get_overall_ranking('month')
     today = datetime.now()
     month_name = today.strftime('%B %Y')
     
     message = f"🎉 <b>Общий зачет ({month_name})</b>\n\n"
-    message += "<i>Система подсчета: 3 очка за 1 место, 2 за 2, 1 за 3</i>\n\n"
+    message += "<i>Система подсчета очков:</i>\n"
+    message += "<i>• За каждое упражнение начисляются очки по местам</i>\n"
+    message += "<i>• 1 место = 90 очков, 2 = 80, 3 = 70, 4 = 60, 5 = 50,</i>\n"
+    message += "<i>  6 = 40, 7 = 30, 8 = 20, 9 = 10, 10 и ниже = 0</i>\n"
+    message += "<i>• Очки суммируются по всем 5 упражнениям</i>\n\n"
     
     if ranking:
-        # Показываем топ-5
-        for i, (user_id, data) in enumerate(ranking[:5], 1):
+        # Показываем всех участников
+        for i, (user_id, data) in enumerate(ranking, 1):
             name = data['name']
-            points = data['total_points']
+            points = data['points']
             
             if i == 1:
                 message += f"🥇 <b>{name}</b> - {points} очков\n"
@@ -750,19 +828,17 @@ async def overall_winner(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 message += f"🥉 <b>{name}</b> - {points} очков\n"
             else:
                 message += f"{i}. <b>{name}</b> - {points} очков\n"
-            
-            # Показываем места по упражнениям
-            places_text = []
-            for exercise, place in data['places'].items():
-                exercise_name = EXERCISES.get(exercise, exercise)
-                places_text.append(f"{exercise_name}: {place}")
-            
-            if places_text:
-                message += f"   <i>({', '.join(places_text)})</i>\n"
         
-        message += "\n<b>Победитель получает приз: 2000 рублей! 🏆</b>"
+        # Определяем победителя
+        if ranking[0][1]['points'] > 0:
+            winner_name = ranking[0][1]['name']
+            winner_points = ranking[0][1]['points']
+            message += f"\n<b>🏆 ПОБЕДИТЕЛЬ: {winner_name} с {winner_points} очками!</b>\n"
+            message += f"<b>Приз: 2000 рублей! 💰</b>"
+        else:
+            message += "\n<b>Еще нет данных для определения победителя.</b>"
     else:
-        message += "Пока нет данных для определения победителя.\n"
+        message += "Пока нет участников с тренировками в этом месяце.\n"
         message += "Начните тренировки! 💪"
     
     await update.message.reply_text(message, parse_mode=ParseMode.HTML)
@@ -776,10 +852,10 @@ async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = f"🏆 <b>Еженедельный лидерборд ({month_name})</b>\n\n"
     
     if ranking:
-        # Показываем топ-5
-        for i, (user_id, data) in enumerate(ranking[:5], 1):
+        # Показываем топ-10
+        for i, (user_id, data) in enumerate(ranking[:10], 1):
             name = data['name']
-            points = data['total_points']
+            points = data['points']
             
             if i == 1:
                 message += f"🥇 <b>{name}</b> - {points} очков\n"
@@ -801,13 +877,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
 <b>📋 Доступные команды:</b>
 
-/start - Показать главное меню с клавиатурой
+/start - Начальная информация
+/menu - Показать клавиатуру с кнопками
 /help - Эта справка
 /weekly - Еженедельный лидерборд
 /cancel - Отменить текущее действие
 
 <b>🎯 Как пользоваться:</b>
-1. Используйте кнопки внизу экрана
+1. Нажмите /menu чтобы показать клавиатуру
 2. Нажмите "Записать тренировку"
 3. Выберите упражнение
 4. Введите количество в течение 30 секунд
@@ -818,13 +895,20 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🦵 <b>Приседания</b> - количество раз  
 💪 <b>Подтягивания</b> - количество раз
 ⏱️ <b>Планка</b> - время в секундах
+🦵 <b>Подъем ног</b> - количество раз
 
-<b>🏆 Призы:</b>
+<b>🏆 Система очков для общего зачета:</b>
+• За каждое упражнение: 1 место = 90 очков, 2 = 80, 3 = 70,
+  4 = 60, 5 = 50, 6 = 40, 7 = 30, 8 = 20, 9 = 10, 10 и ниже = 0
+• Очки суммируются по всем упражнениям
+
+<b>💰 Призы:</b>
 В конце месяца победитель в общем зачете получает 2000 рублей!
-
-<b>📱 Кнопки всегда под рукой!</b>
 """
-    await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        help_text,
+        parse_mode=ParseMode.HTML
+    )
 
 # Главная функция
 def main():
@@ -836,6 +920,7 @@ def main():
     
     # Добавление обработчиков команд
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("menu", show_menu))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("weekly", weekly))
     application.add_handler(CommandHandler("cancel", cancel))
@@ -854,16 +939,21 @@ def main():
     print("📱 Работает на Android через Pydroid 3")
     print("=" * 50)
     print("\n🎯 Особенности этой версии:")
-    print("✅ 4 упражнения: отжимания, приседания, подтягивания, планка")
-    print("✅ Постоянная клавиатура внизу экрана")
-    print("✅ Общий зачет по системе очков (3-2-1)")
-    print("✅ Подробная статистика по каждому упражнению")
+    print("✅ 5 упражнений: отжимания, приседания, подтягивания, планка, подъем ног")
+    print("✅ Клавиатура скрыта по умолчанию (показывается по команде /menu)")
+    print("✅ Новая система подсчета очков: 90-80-70-60-50-40-30-20-10-0")
+    print("✅ Имена участников: Бах, Никитос, Женя (по username)")
+    print("✅ Общий зачет по сумме очков из всех упражнений")
     print("=" * 50)
-    print("\n💡 Совет:")
-    print("1. Добавьте бота в группу")
-    print("2. Назначьте администратором")
-    print("3. Напишите в группе /start")
-    print("4. Используйте кнопки для управления")
+    print("\n💡 Настройка бота через @BotFather:")
+    print("1. Добавьте команды в меню бота:")
+    print("   start - Начальная информация")
+    print("   menu - Показать клавиатуру")
+    print("   help - Помощь")
+    print("   weekly - Лидерборд")
+    print("2. Добавьте бота в группу")
+    print("3. Назначьте администратором")
+    print("4. Напишите в группе /menu")
     print("=" * 50)
     
     try:
